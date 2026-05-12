@@ -1,6 +1,6 @@
 # Archicad CLI (`ac`)
 
-A fast, local command-line tool that lets Claude Code (and you) talk directly to your running Archicad model. It bypasses the MCP tool-discovery layer entirely — most queries return in **under a second**, and the `/archicad` slash command in Claude Code gives a curated, low-token workflow for BIM tasks.
+A fast, local command-line tool that lets Claude Code (and you) talk directly to your running Archicad model. It bypasses the MCP tool-discovery layer entirely most queries return in **under a few seconds (dependant on task complexity)**, and the `/archicad` slash command in Claude Code gives a curated, low-token workflow for BIM tasks.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)]()
@@ -128,7 +128,6 @@ cd ~/Archicad-CLI && bash uninstall.sh   # clean removal
 Contributions are welcome! This project is in active development and there are plenty of rough edges. Useful directions to help:
 
 - Cross-platform support (Linux / Windows).
-- Better window/door schedule rendering (top-hung detection, side-light glass rendering, accurate sash heights from `vergrid`/`horgrid` arrays).
 - More built-in `ac` verbs for common architectural workflows.
 - Custom Tapir command support in non-default namespaces.
 
