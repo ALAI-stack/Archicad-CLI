@@ -1,0 +1,1243 @@
+#!/usr/bin/env python3
+"""
+Fast Archicad query tool. Talks directly to Archicad's HTTP JSON-RPC API
+(exposed by the Tapir Archicad Add-On).
+
+Read / discover:
+  ac ports                            -> list active Archicad ports
+  ac selected                         -> summarise the current selection (count, types, GUIDs)
+  ac zones [--by-category]            -> total zone count, optionally grouped by category
+  ac categories                       -> list all zone categories
+  ac surfaces [<pattern>]             -> list surfaces (optional regex on name)
+  ac properties [<pattern>]           -> list property definitions (optional regex on name)
+  ac layers [<pattern>]               -> list layers (optional regex on name)
+
+Modify:
+  ac set-wall-bm <name> [--all-walls] [--filter-layer <regex>]
+                                      -> assign a Building Material (by name) to selected walls
+  ac set-wall-composite <name> [--all-walls] [--filter-layer <regex>]
+                                      -> assign a Composite (by name) to selected walls
+  ac set-surface <name> [--side ref|opp|side|all] [--all-walls] [--filter-layer <regex>]
+                                      -> attempt wall surface override (NOTE: AC currently rejects this write)
+
+Schedules / documents:
+  ac schedule [--out <path>] [--min-floor N] [--max-floor N] [--all-floors]
+                                      -> build window/door schedule XLSX (default: ground floor and up)
+
+Geometry:
+  ac measure [guid1 guid2]            -> face-to-face distance between 2 selected (or given) elements
+
+Escape hatches:
+  ac call <Command> [json-params]     -> any official Archicad JSON-RPC command
+  ac tapir <Command> [json-params]    -> any Tapir add-on command
+
+Daemon:
+  ac status                           -> daemon + cache status
+  ac stop                             -> stop the background daemon
+  ac --daemon                         -> run as daemon (used internally by auto-spawn)
+
+Diagnostics:
+  ac doctor                           -> self-check: install paths, Archicad reachable, daemon health
+
+Options:
+  --port N        Force a specific Archicad port (skips cache + daemon)
+  --no-daemon     Bypass the daemon for this call (use direct HTTP)
+"""
+import json, sys, os, time, socket, math, signal, errno
+from concurrent.futures import ThreadPoolExecutor
+from http.client import HTTPConnection, RemoteDisconnected, BadStatusLine
+
+
+class AcApiError(Exception):
+    """Raised when Archicad returns succeeded:false."""
+    def __init__(self, code, message, command=""):
+        self.code = code
+        self.message = message
+        self.command = command
+        super().__init__(f"{command or 'call'} → Archicad error {code}: {message}")
+
+# Common error code → human hint
+_ERR_HINT = {
+    4001: "no open project — open a .pln in Archicad and retry",
+    4010: "Tapir command not registered in this Archicad — Tapir add-on may need updating",
+    -2130313968: "no open project — open a .pln in Archicad and retry",
+    -2130312310: "Archicad rejected the property write — the property is reported editable but cannot be set via JSON-RPC in this version (e.g. wall surface override)",
+}
+
+def explain_ac_error(e):
+    """Return a one-line user-facing explanation."""
+    base = f"Archicad error {e.code}: {e.message}"
+    hint = _ERR_HINT.get(e.code)
+    return f"{base}  ({hint})" if hint else base
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+DAEMON_SOCK    = "/tmp/ac.sock"
+DAEMON_PID     = "/tmp/ac.pid"
+PORT_CACHE     = "/tmp/.ac-port"
+PORT_CACHE_TTL = 60        # seconds before we re-validate the cached port
+PROBE_TIMEOUT  = 0.3       # localhost ECONNREFUSED is instant; keep tight
+QUERY_TIMEOUT  = 30        # actual query budget
+DAEMON_IDLE    = 600       # daemon self-exits after this many idle seconds
+PORT_RANGE     = range(19723, 19744)
+
+
+# ── Low-level HTTP (direct) ───────────────────────────────────────────────────
+
+def _post(conn, payload, timeout):
+    body = json.dumps(payload).encode()
+    hdr = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+    conn.request("POST", "/", body, hdr)
+    return json.loads(conn.getresponse().read())
+
+def http_post(port, payload, conn=None, timeout=QUERY_TIMEOUT):
+    """POST JSON to localhost:port. Reuses `conn` if provided."""
+    owned = conn is None
+    if owned:
+        conn = HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        try:
+            return _post(conn, payload, timeout)
+        except (RemoteDisconnected, BadStatusLine, ConnectionResetError):
+            # Stale keep-alive — reopen once.
+            try: conn.close()
+            except Exception: pass
+            conn = HTTPConnection("127.0.0.1", port, timeout=timeout)
+            return _post(conn, payload, timeout)
+    finally:
+        if owned:
+            try: conn.close()
+            except Exception: pass
+
+def call_official(port, command, params=None, conn=None, strict=False):
+    payload = {"command": command}
+    if params is not None:
+        payload["parameters"] = params
+    res = http_post(port, payload, conn=conn)
+    if strict and isinstance(res, dict) and res.get("succeeded") is False:
+        err = res.get("error", {})
+        raise AcApiError(err.get("code"), err.get("message", "unknown"), command)
+    return res
+
+def call_tapir(port, command, params=None, conn=None, strict=False):
+    payload = {
+        "command": "API.ExecuteAddOnCommand",
+        "parameters": {
+            "addOnCommandId": {
+                "commandNamespace": "TapirCommand",
+                "commandName": command,
+            },
+            "addOnCommandParameters": params or {},
+        },
+    }
+    res = http_post(port, payload, conn=conn)
+    if isinstance(res, dict) and res.get("succeeded") is False:
+        if strict:
+            err = res.get("error", {})
+            raise AcApiError(err.get("code"), err.get("message", "unknown"), command)
+        return res  # non-strict: caller sees raw error response
+    return res.get("result", {}).get("addOnCommandResponse", res)
+
+
+# ── Port discovery ────────────────────────────────────────────────────────────
+
+def probe(port, timeout=PROBE_TIMEOUT):
+    try:
+        c = HTTPConnection("127.0.0.1", port, timeout=timeout)
+        body = b'{"command":"API.GetProductInfo"}'
+        c.request("POST", "/", body,
+                  {"Content-Type": "application/json", "Content-Length": str(len(body))})
+        d = json.loads(c.getresponse().read())
+        c.close()
+        if d.get("succeeded"):
+            return (port, d["result"])
+    except Exception:
+        pass
+    return None
+
+def scan_ports(with_project_name=False):
+    """Probe all candidate ports. Project-name lookup is opt-in (only `ports` needs it)."""
+    hits = []
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for hit in ex.map(probe, PORT_RANGE):
+            if hit:
+                hits.append(hit)
+    if with_project_name:
+        for p, info in hits:
+            try:
+                proj = call_tapir(p, "GetProjectInfoFields")
+                info["projectName"] = next(
+                    (f.get("projectInfoValue") for f in proj.get("fields", [])
+                     if f.get("projectInfoId") == "ProjectName"), None
+                )
+            except Exception:
+                pass
+    return hits
+
+def read_cached_port():
+    """Return cached port if file is fresh AND port still answers a quick ping."""
+    try:
+        st = os.stat(PORT_CACHE)
+        if time.time() - st.st_mtime > PORT_CACHE_TTL:
+            return None
+        with open(PORT_CACHE) as f:
+            port = int(f.read().strip())
+        if probe(port, timeout=PROBE_TIMEOUT):
+            return port
+    except Exception:
+        return None
+    return None
+
+def write_cached_port(port):
+    try:
+        with open(PORT_CACHE, "w") as f:
+            f.write(str(port))
+    except Exception:
+        pass
+
+def resolve_port_directly():
+    """Find a port to use without involving the daemon. Cache + scan."""
+    p = read_cached_port()
+    if p is not None:
+        return p
+    hits = scan_ports(with_project_name=False)
+    if not hits:
+        return None
+    p = hits[0][0]
+    write_cached_port(p)
+    if len(hits) > 1:
+        print(f"Multiple Archicads found, using {p}. Override with --port N", file=sys.stderr)
+    return p
+
+
+# ── Daemon client ─────────────────────────────────────────────────────────────
+
+def daemon_call(req, timeout=10.0):
+    """Send one JSON request to the daemon over the Unix socket. Returns response or None."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(DAEMON_SOCK)
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk: break
+            buf += chunk
+        s.close()
+        return json.loads(buf.decode()) if buf else None
+    except Exception:
+        return None
+
+def ensure_daemon_running(timeout_seconds=2.0):
+    """Spawn the daemon if needed. Returns True if a daemon is reachable."""
+    if daemon_call({"cmd": "ping"}, timeout=0.3):
+        return True
+    # Double-fork detach
+    try:
+        pid = os.fork()
+    except OSError:
+        return False
+    if pid > 0:
+        # Parent: poll briefly until the socket appears
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            time.sleep(0.05)
+            if daemon_call({"cmd": "ping"}, timeout=0.2):
+                return True
+        return False
+    # Child: detach into a new session, then exec daemon mode
+    try:
+        os.setsid()
+        if os.fork() > 0:
+            os._exit(0)
+        # Redirect stdio so the daemon doesn't hold a TTY
+        with open(os.devnull, "rb", 0) as devnull_r, open(os.devnull, "ab", 0) as devnull_w:
+            os.dup2(devnull_r.fileno(), 0)
+            os.dup2(devnull_w.fileno(), 1)
+            os.dup2(devnull_w.fileno(), 2)
+        os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), "--daemon"])
+    except Exception:
+        os._exit(1)
+
+
+# ── Daemon process ────────────────────────────────────────────────────────────
+
+class DaemonState:
+    def __init__(self):
+        self.port = None
+        self.conn = None  # persistent HTTP keep-alive connection
+
+    def _open_conn(self, port):
+        self.port = port
+        try:
+            if self.conn:
+                self.conn.close()
+        except Exception:
+            pass
+        self.conn = HTTPConnection("127.0.0.1", port, timeout=QUERY_TIMEOUT)
+
+    def get_port(self, force=False):
+        if self.port is not None and not force:
+            return self.port
+        p = read_cached_port()
+        if p is None:
+            hits = scan_ports(with_project_name=False)
+            if not hits:
+                return None
+            p = hits[0][0]
+            write_cached_port(p)
+        self._open_conn(p)
+        return p
+
+    def _do_call(self, kind, command, params):
+        if kind == "tapir":
+            return call_tapir(self.port, command, params, conn=self.conn)
+        return call_official(self.port, command, params, conn=self.conn)
+
+    def call(self, kind, command, params):
+        port = self.get_port()
+        if port is None:
+            return {"error": "no_archicad"}
+        try:
+            return {"result": self._do_call(kind, command, params)}
+        except (ConnectionError, TimeoutError, OSError, RemoteDisconnected, BadStatusLine):
+            # Re-open and retry once (common after Archicad restart)
+            self.port = None
+            port = self.get_port(force=True)
+            if port is None:
+                return {"error": "no_archicad"}
+            try:
+                return {"result": self._do_call(kind, command, params)}
+            except Exception as e:
+                return {"error": "call_failed", "detail": str(e)}
+        except Exception as e:
+            return {"error": "call_failed", "detail": str(e)}
+
+    def handle(self, req):
+        c = req.get("cmd")
+        if c == "ping":
+            return {"ok": True, "port": self.port}
+        if c == "ports":
+            return {"ports": scan_ports(with_project_name=True)}
+        if c == "tapir":
+            return self.call("tapir", req.get("command"), req.get("params"))
+        if c == "official":
+            return self.call("official", req.get("command"), req.get("params"))
+        if c == "stop":
+            return {"ok": True, "stopping": True}
+        return {"error": "unknown_cmd"}
+
+
+def run_daemon():
+    """Entry point for `ac --daemon`."""
+    try:
+        os.unlink(DAEMON_SOCK)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(DAEMON_SOCK)
+    os.chmod(DAEMON_SOCK, 0o600)
+    srv.listen(8)
+    srv.settimeout(DAEMON_IDLE)
+
+    try:
+        with open(DAEMON_PID, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+    state = DaemonState()
+    state.get_port()  # warm up
+
+    def cleanup(*_):
+        try: os.unlink(DAEMON_SOCK)
+        except Exception: pass
+        try: os.unlink(DAEMON_PID)
+        except Exception: pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            cleanup()
+        try:
+            conn.settimeout(5.0)
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk: break
+                buf += chunk
+            req = json.loads(buf.decode()) if buf else {}
+            resp = state.handle(req)
+            conn.sendall((json.dumps(resp) + "\n").encode())
+            stop = req.get("cmd") == "stop"
+            try: conn.close()
+            except Exception: pass
+            if stop:
+                cleanup()
+        except Exception:
+            try: conn.close()
+            except Exception: pass
+
+
+# ── Routing helper ────────────────────────────────────────────────────────────
+
+def call_via(kind, command, params=None, port_override=None):
+    """
+    Make one Tapir/official call. If --port given, hit HTTP directly.
+    Otherwise try the daemon first (auto-spawning if needed) and fall back
+    to direct HTTP.
+    """
+    if port_override is not None:
+        if kind == "tapir":
+            return call_tapir(port_override, command, params)
+        return call_official(port_override, command, params)
+
+    use_daemon = "--no-daemon" not in sys.argv
+    if use_daemon and ensure_daemon_running():
+        resp = daemon_call({"cmd": kind, "command": command, "params": params})
+        if resp is not None:
+            if "error" in resp:
+                if resp["error"] == "no_archicad":
+                    print("No active Archicad found", file=sys.stderr); sys.exit(2)
+                # Fall through to direct on other errors
+            else:
+                return resp.get("result")
+
+    port = resolve_port_directly()
+    if port is None:
+        print("No active Archicad found", file=sys.stderr); sys.exit(2)
+    if kind == "tapir":
+        return call_tapir(port, command, params)
+    return call_official(port, command, params)
+
+
+def shared_http_conn():
+    """Open a single HTTPConnection for multi-call helpers (zones --by-category, measure)."""
+    port = resolve_port_directly()
+    if port is None:
+        print("No active Archicad found", file=sys.stderr); sys.exit(2)
+    return port, HTTPConnection("127.0.0.1", port, timeout=QUERY_TIMEOUT)
+
+
+# ── Geometry helpers (for `ac measure`) ───────────────────────────────────────
+
+def thickness_from_ref_and_bbox(p1, p2, bbox):
+    """Wall thickness from reference line direction + axis-aligned bbox."""
+    dx, dy = p2[0]-p1[0], p2[1]-p1[1]
+    L = math.hypot(dx, dy)
+    if L < 1e-9:
+        return 0.0, 0.0
+    ux, uy = dx/L, dy/L
+    au, bu = abs(ux), abs(uy)
+    nx_abs, ny_abs = abs(-uy), abs(ux)
+    bx = bbox["xMax"] - bbox["xMin"]
+    by = bbox["yMax"] - bbox["yMin"]
+    denom = nx_abs * bu - ny_abs * au
+    if abs(denom) < 1e-9:
+        return 0.0, L
+    t = (bx * bu - by * au) / denom
+    return abs(t), L
+
+def wall_inner_face(p1, p2, thickness, bbox):
+    """Return (ref_face, opposite_face) — caller picks whichever is inner."""
+    dx, dy = p2[0]-p1[0], p2[1]-p1[1]
+    L = math.hypot(dx, dy)
+    if L < 1e-9:
+        return (p1, p2), (p1, p2)
+    ux, uy = dx/L, dy/L
+    lx, ly = -uy, ux
+    bbox_cx = (bbox["xMin"]+bbox["xMax"])/2
+    bbox_cy = (bbox["yMin"]+bbox["yMax"])/2
+    ref_mx  = (p1[0]+p2[0])/2
+    ref_my  = (p1[1]+p2[1])/2
+    proj = lx*(bbox_cx-ref_mx) + ly*(bbox_cy-ref_my)
+    if proj >= 0:
+        ox, oy = lx*thickness, ly*thickness
+    else:
+        ox, oy = -lx*thickness, -ly*thickness
+    opp1 = (p1[0]+ox, p1[1]+oy)
+    opp2 = (p2[0]+ox, p2[1]+oy)
+    return (p1, p2), (opp1, opp2)
+
+def perp_dist_between_lines(a1, a2, b1):
+    """Perpendicular distance from infinite line a1→a2 to point b1."""
+    dx, dy = a2[0]-a1[0], a2[1]-a1[1]
+    L = math.hypot(dx, dy)
+    if L < 1e-9:
+        return math.hypot(b1[0]-a1[0], b1[1]-a1[1])
+    nx, ny = -dy/L, dx/L
+    return nx*(b1[0]-a1[0]) + ny*(b1[1]-a1[1])
+
+def measure_wall_pair(a, b):
+    fa_ref, fa_opp = wall_inner_face(a["p1"], a["p2"], a["thickness"], a["bbox"])
+    fb_ref, fb_opp = wall_inner_face(b["p1"], b["p2"], b["thickness"], b["bbox"])
+    a_mid = ((a["p1"][0]+a["p2"][0])/2, (a["p1"][1]+a["p2"][1])/2)
+    b_mid = ((b["p1"][0]+b["p2"][0])/2, (b["p1"][1]+b["p2"][1])/2)
+
+    def face_mid(f1, f2):
+        return ((f1[0]+f2[0])/2, (f1[1]+f2[1])/2)
+
+    def closer(fa, fb, target):
+        da = math.hypot(face_mid(*fa)[0]-target[0], face_mid(*fa)[1]-target[1])
+        db = math.hypot(face_mid(*fb)[0]-target[0], face_mid(*fb)[1]-target[1])
+        return fa if da < db else fb
+
+    inner_a = closer(fa_ref, fa_opp, b_mid)
+    inner_b = closer(fb_ref, fb_opp, a_mid)
+    return abs(perp_dist_between_lines(inner_a[0], inner_a[1], inner_b[0])) * 1000  # mm
+
+
+def measure_elements(guids, port_override=None):
+    """Face-to-face clear distance (mm) between two elements. Uses one shared HTTP conn."""
+    elem_list = [{"elementId": {"guid": g}} for g in guids]
+
+    if port_override is not None:
+        port, conn = port_override, HTTPConnection("127.0.0.1", port_override, timeout=QUERY_TIMEOUT)
+    else:
+        port, conn = shared_http_conn()
+
+    try:
+        details_resp = call_tapir(port, "GetDetailsOfElements", {"elements": elem_list}, conn=conn)
+        bbox_resp    = call_tapir(port, "Get3DBoundingBoxes",   {"elements": elem_list}, conn=conn)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    details_list = details_resp.get("detailsOfElements", [])
+    bboxes_list  = bbox_resp.get("boundingBoxes3D", [])
+
+    results = []
+    for det, bb_wrap in zip(details_list, bboxes_list):
+        bb = bb_wrap.get("boundingBox3D", bb_wrap)
+        etype = det.get("type", "")
+        if etype == "Wall":
+            d = det.get("details", {})
+            p1 = (d["begCoordinate"]["x"], d["begCoordinate"]["y"])
+            p2 = (d["endCoordinate"]["x"], d["endCoordinate"]["y"])
+            thick, _ = thickness_from_ref_and_bbox(p1, p2, bb)
+            results.append({"type": "Wall", "p1": p1, "p2": p2,
+                            "thickness": thick, "bbox": bb, "id": det.get("id", "?")})
+        else:
+            cx = (bb["xMin"]+bb["xMax"])/2
+            cy = (bb["yMin"]+bb["yMax"])/2
+            results.append({"type": etype, "p1": (cx, cy), "p2": (cx, cy),
+                            "thickness": 0, "bbox": bb, "id": det.get("id", "?")})
+
+    if len(results) < 2:
+        return None, results
+    a, b = results[0], results[1]
+    if a["type"] == "Wall" and b["type"] == "Wall":
+        return measure_wall_pair(a, b), results
+    # Non-wall fallback: closest bbox faces
+    gaps = [
+        (b["bbox"]["xMin"] - a["bbox"]["xMax"]) * 1000,
+        (a["bbox"]["xMin"] - b["bbox"]["xMax"]) * 1000,
+        (b["bbox"]["yMin"] - a["bbox"]["yMax"]) * 1000,
+        (a["bbox"]["yMin"] - b["bbox"]["yMax"]) * 1000,
+    ]
+    positive = [g for g in gaps if g > 0]
+    return (min(positive) if positive else max(gaps)), results
+
+
+# ── Discovery & modification helpers ──────────────────────────────────────────
+
+import re
+
+PROPS_CACHE = "/tmp/.ac-props.json"   # cached property-name → GUID map
+
+def _shared_or_override(port_override):
+    """Return (port, conn) using port_override if given, else cached/discovered."""
+    if port_override is not None:
+        return port_override, HTTPConnection("127.0.0.1", port_override, timeout=QUERY_TIMEOUT)
+    return shared_http_conn()
+
+def get_selection(port, conn):
+    sel = call_tapir(port, "GetSelectedElements", {}, conn=conn, strict=True)
+    return sel.get("elements", [])
+
+def cmd_selected(port_override=None):
+    port, conn = _shared_or_override(port_override)
+    # Show port + project for visibility (helps diagnose multi-AC / wrong-instance bugs).
+    try:
+        try:
+            info = call_official(port, "API.GetProductInfo", conn=conn, strict=True)
+            ver = info.get("result", {}).get("version", "?")
+        except AcApiError as e:
+            ver = f"(error {e.code})"
+        try:
+            proj = call_tapir(port, "GetProjectInfoFields", {}, conn=conn, strict=True)
+            project_name = next(
+                (f.get("projectInfoValue") for f in proj.get("fields", [])
+                 if f.get("projectInfoId") == "ProjectName"), None
+            )
+        except AcApiError:
+            project_name = None
+        print(f"# port={port}  ver={ver}  project={project_name or '(unsaved/none)'}")
+
+        elems = get_selection(port, conn)
+        if not elems:
+            print("(nothing selected)"); return
+        try:
+            tres = call_tapir(port, "GetDetailsOfElements", {"elements": elems}, conn=conn, strict=True)
+            details_arr = tres.get("detailsOfElements", [])
+        except AcApiError as e:
+            print(f"# WARNING: GetDetailsOfElements failed: {explain_ac_error(e)}", file=sys.stderr)
+            details_arr = []
+        by_type = {}
+        for i, e in enumerate(elems):
+            t = "?"
+            if i < len(details_arr):
+                t = details_arr[i].get("type", "?")
+            by_type.setdefault(t, []).append(e["elementId"]["guid"])
+        for t, guids in sorted(by_type.items(), key=lambda x: -len(x[1])):
+            print(f"{len(guids)}\t{t}")
+            for g in guids[:5]:
+                print(f"\t{g}")
+            if len(guids) > 5:
+                print(f"\t... +{len(guids)-5} more")
+        print(f"---\n{len(elems)}\tTOTAL")
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+def list_attributes(port, conn, attr_type, pattern=None):
+    """Return list of (guid, name, index)."""
+    r = call_tapir(port, "GetAttributesByType", {"attributeType": attr_type}, conn=conn, strict=True)
+    out = []
+    rx = re.compile(pattern, re.IGNORECASE) if pattern else None
+    for a in r.get("attributes", []):
+        name = a.get("name", "")
+        if rx and not rx.search(name):
+            continue
+        guid = a.get("attributeId", {}).get("guid", "")
+        idx  = a.get("index")
+        out.append((guid, name, idx))
+    return out
+
+def cmd_surfaces(pattern, port_override=None):
+    port, conn = _shared_or_override(port_override)
+    try:
+        for guid, name, idx in list_attributes(port, conn, "Surface", pattern):
+            print(f"{idx}\t{guid}\t{name}")
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+def cmd_layers(pattern, port_override=None):
+    port, conn = _shared_or_override(port_override)
+    try:
+        for guid, name, idx in list_attributes(port, conn, "Layer", pattern):
+            print(f"{idx}\t{guid}\t{name}")
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+def fetch_all_property_defs(port, conn):
+    """Returns list of {propertyId, propertyName, propertyGroupName, ...}."""
+    r = call_tapir(port, "GetAllProperties", {}, conn=conn, strict=True)
+    return r.get("properties", [])
+
+def cmd_properties(pattern, port_override=None):
+    port, conn = _shared_or_override(port_override)
+    try:
+        defs = fetch_all_property_defs(port, conn)
+        rx = re.compile(pattern, re.IGNORECASE) if pattern else None
+        for d in defs:
+            full = f"{d.get('propertyGroupName','?')} / {d.get('propertyName','?')}"
+            if rx and not rx.search(full):
+                continue
+            guid = d.get("propertyId", {}).get("guid", "")
+            t = d.get("propertyValueType", "?")
+            print(f"{guid}\t{t}\t{full}")
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+# ── Surface override on walls ────────────────────────────────────────────────
+
+def find_wall_elements(port, conn, all_walls=False, layer_filter=None):
+    """Return list of wall element-id dicts: either current selection or all walls."""
+    if all_walls:
+        wr = call_tapir(port, "GetElementsByType", {"elementType": "Wall"}, conn=conn, strict=True)
+        elems = wr.get("elements", [])
+    else:
+        elems = get_selection(port, conn)
+    if not elems:
+        return [], []
+    # Type-filter to walls only via GetDetailsOfElements (each detail has a "type" field).
+    tres = call_tapir(port, "GetDetailsOfElements", {"elements": elems}, conn=conn, strict=True)
+    details_arr = tres.get("detailsOfElements", [])
+    walls = [e for e, d in zip(elems, details_arr) if d.get("type") == "Wall"]
+    skipped = [(e, d.get("type", "?")) for e, d in zip(elems, details_arr)
+               if d.get("type") != "Wall"]
+
+    # Layer filter (regex on layer name).
+    if layer_filter and walls:
+        rx = re.compile(layer_filter, re.IGNORECASE)
+        det = call_tapir(port, "GetDetailsOfElements",
+                         {"elements": walls}, conn=conn).get("detailsOfElements", [])
+        layers = list_attributes(port, conn, "Layer")
+        layer_name = {g.lower(): n for g, n in layers}
+        kept = []
+        for w, d in zip(walls, det):
+            lid = d.get("floorIndex") and ""  # placeholder; real layer is on attributes — use layerAttributeId via GetClassifications? Use details directly:
+            # WallDetails doesn't include layerAttributeId. Fall back to GetSubelementOfHierarchical or per-element call.
+            # Simpler: ask Tapir for the layer using the official 'Elements_GetParametersOfElements' or 'GetLayerOfElements' if exists.
+            # We try a generic property-based path below; for now keep all walls if we couldn't determine.
+            kept.append(w)
+        # If layer filtering fails silently, we keep all walls — better than refusing the action.
+        walls = kept
+    return walls, skipped
+
+# In Archicad 28+, wall surface override is set via three Integer properties
+# in the "Wall" group. The value is the surface attribute INDEX (string-encoded).
+# These are static-built-in property GUIDs (stable across projects).
+WALL_SURFACE_PROP_NAMES = {
+    "ref":  ("Wall", "Inside Face Surface"),
+    "opp":  ("Wall", "Outside Face Surface"),
+    "side": ("Wall", "Edge Surface"),
+}
+KNOWN_WALL_SURFACE_GUIDS = {
+    "ref":  "040B4864-6DB7-47B1-BA6B-1EA4A350D160",  # Wall / Inside Face Surface
+    "opp":  "3AFE2A1E-24D4-457B-BB18-F540A915F768",  # Wall / Outside Face Surface
+    "side": "830F3981-BFDC-4E23-8578-9CF34A5047EA",  # Wall / Edge Surface
+}
+
+def discover_surface_properties(port, conn):
+    """Return {side: {'guid': propGuid, 'name': '<group>/<name>'}}.
+    Fast path: use the known static built-in GUIDs (no GetAllProperties call).
+    """
+    out = {}
+    for side, (grp, name) in WALL_SURFACE_PROP_NAMES.items():
+        out[side] = {"guid": KNOWN_WALL_SURFACE_GUIDS[side], "name": f"{grp} / {name}"}
+    return out
+
+def discover_surface_properties_slow(port, conn):
+    """Fallback: discover via GetAllProperties by name lookup (used if the fast path fails)."""
+    defs = fetch_all_property_defs(port, conn)
+    by_full = {}
+    for d in defs:
+        full = (d.get("propertyGroupName", ""), d.get("propertyName", ""))
+        by_full[full] = d
+    out = {}
+    for side, target in WALL_SURFACE_PROP_NAMES.items():
+        d = by_full.get(target)
+        if d:
+            out[side] = {
+                "guid": d["propertyId"]["guid"],
+                "name": f"{target[0]} / {target[1]}",
+                "valueType": d.get("propertyValueType", "?"),
+            }
+    return out
+
+# Wall structure (BM / Composite / Profile) is held in this single Integer property.
+# Setting it to an attribute index actually changes the wall's structure assignment.
+WALL_STRUCTURE_PROP_GUID = "F135DC6C-614B-4089-99FF-2BDE127AF250"
+
+def _read_wall_structure_values(port, conn, walls):
+    """Return list of current structure indices (as strings) parallel to `walls`."""
+    r = call_tapir(port, "GetPropertyValuesOfElements",
+        {"elements": walls,
+         "properties": [{"propertyId": {"guid": WALL_STRUCTURE_PROP_GUID}}]},
+        conn=conn, strict=True)
+    out = []
+    for e in r.get("propertyValuesForElements", []):
+        pv = e.get("propertyValues", [])
+        if pv and isinstance(pv[0], dict) and "propertyValue" in pv[0]:
+            out.append(pv[0]["propertyValue"].get("value", "?"))
+        else:
+            out.append("?")
+    return out
+
+
+def cmd_set_wall_structure(attr_type, name, all_walls=False, layer_filter=None, port_override=None):
+    """Assign a BuildingMaterial or Composite (by name) to selected walls.
+    `attr_type` is "BuildingMaterial" or "Composite" (matches GetAttributesByType).
+    """
+    if not name:
+        print(f"usage: ac set-wall-{'bm' if attr_type=='BuildingMaterial' else 'composite'} <name> [--all-walls] [--filter-layer <regex>]",
+              file=sys.stderr); sys.exit(1)
+
+    port, conn = _shared_or_override(port_override)
+    try:
+        # 1. Find the attribute by name (substring, case-insensitive; exact wins ties)
+        attrs = list_attributes(port, conn, attr_type)
+        rx = re.compile(re.escape(name), re.IGNORECASE)
+        match = [a for a in attrs if rx.search(a[1])]
+        if not match:
+            print(f"No {attr_type} matching '{name}'.", file=sys.stderr)
+            print(f"Try `ac tapir GetAttributesByType '{{\"attributeType\":\"{attr_type}\"}}'` to list.",
+                  file=sys.stderr); sys.exit(2)
+        if len(match) > 1:
+            exact = [a for a in match if a[1].lower() == name.lower()]
+            if exact:
+                match = exact
+            else:
+                print(f"Multiple {attr_type} match '{name}':", file=sys.stderr)
+                for g, n, i in match[:10]:
+                    print(f"  idx={i:>4}  {n}", file=sys.stderr)
+                print("Use a more specific name.", file=sys.stderr); sys.exit(2)
+        guid, full_name, idx = match[0]
+        if idx is None:
+            print(f"{attr_type} '{full_name}' has no index — cannot assign.",
+                  file=sys.stderr); sys.exit(3)
+        print(f"{attr_type}: {full_name}  (idx={idx})")
+
+        # 2. Resolve target walls
+        walls, skipped = find_wall_elements(port, conn, all_walls=all_walls, layer_filter=layer_filter)
+        if not walls:
+            print("No target walls (selection empty or no walls in selection).", file=sys.stderr)
+            sys.exit(2)
+        if skipped:
+            sk_types = {}
+            for _, t in skipped:
+                sk_types[t] = sk_types.get(t, 0) + 1
+            print("Skipping non-wall selection: " + ", ".join(f"{n} {t}" for t, n in sk_types.items()))
+        print(f"Walls to update: {len(walls)}")
+
+        # 3. Read current values (so we can show before/after and warn on no-op)
+        before = _read_wall_structure_values(port, conn, walls)
+        unique_before = set(before)
+        if len(unique_before) == 1:
+            cur = next(iter(unique_before))
+            print(f"Current structure: idx {cur} (uniform across selection)")
+            if cur == str(idx):
+                print(f"Already at idx {idx} — nothing to do."); return
+        else:
+            print(f"Current structures vary across selection: {sorted(unique_before)}")
+
+        # 4. Send the SetPropertyValuesOfElements
+        epv = [{
+            "elementId": w["elementId"],
+            "propertyId": {"guid": WALL_STRUCTURE_PROP_GUID},
+            "propertyValue": {"value": str(idx)},
+        } for w in walls]
+        res = call_tapir(port, "SetPropertyValuesOfElements",
+                         {"elementPropertyValues": epv}, conn=conn, strict=True)
+        results = res.get("executionResults", [])
+        ok = sum(1 for r in results if r.get("success") is True)
+        fail = [r for r in results if r.get("success") is False or r.get("error")]
+        print(f"Sent {len(epv)} updates: ok={ok}  fail={len(fail)}")
+        if fail:
+            codes = {}
+            for r in fail:
+                c = r.get("error", {}).get("code")
+                codes[c] = codes.get(c, 0) + 1
+            top_code, top_n = max(codes.items(), key=lambda x: x[1])
+            hint = _ERR_HINT.get(top_code, "")
+            print(f"  most common error: code={top_code} ({top_n}x){'  — ' + hint if hint else ''}",
+                  file=sys.stderr)
+
+        # 5. Verify by readback (catches the BM/Composite ambiguity case where
+        #    Archicad accepts the index but interprets it differently than expected)
+        after = _read_wall_structure_values(port, conn, walls)
+        applied = sum(1 for v in after if v == str(idx))
+        if applied != ok:
+            print(f"  WARNING: write reported ok={ok} but readback shows {applied}/{len(after)} walls now at idx={idx}",
+                  file=sys.stderr)
+        elif applied == len(walls):
+            print(f"Verified: all {applied} walls now at idx {idx}.")
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+def cmd_set_surface(surface_name, side="all", all_walls=False, layer_filter=None, port_override=None):
+    if not surface_name:
+        print("usage: ac set-surface <surface_name> [--side ref|opp|side|all] [--all-walls] [--filter-layer <regex>]",
+              file=sys.stderr); sys.exit(1)
+
+    port, conn = _shared_or_override(port_override)
+    try:
+        # 1. Find surface attribute (need its INDEX — that's the value walls store)
+        all_surf = list_attributes(port, conn, "Surface")
+        rx_name = re.compile(re.escape(surface_name), re.IGNORECASE)
+        match = [s for s in all_surf if rx_name.search(s[1])]
+        if not match:
+            print(f"No surface matching '{surface_name}'. Try `ac surfaces` to list.", file=sys.stderr)
+            sys.exit(2)
+        if len(match) > 1:
+            exact = [s for s in match if s[1].lower() == surface_name.lower()]
+            if exact:
+                match = exact
+            else:
+                print(f"Multiple surfaces match '{surface_name}':", file=sys.stderr)
+                for g, n, i in match[:10]:
+                    print(f"  idx={i}  {g}\t{n}", file=sys.stderr)
+                print("Use a more specific name.", file=sys.stderr)
+                sys.exit(2)
+        surface_guid, surface_name_full, surface_idx = match[0]
+        if surface_idx is None:
+            print(f"Surface '{surface_name_full}' has no index — cannot set as Integer property value.",
+                  file=sys.stderr); sys.exit(3)
+        print(f"Surface: {surface_name_full}  (idx={surface_idx}, guid={surface_guid})")
+
+        # 2. Find target walls
+        walls, skipped = find_wall_elements(port, conn, all_walls=all_walls, layer_filter=layer_filter)
+        if not walls:
+            print("No target walls (selection empty or no walls in selection).", file=sys.stderr)
+            sys.exit(2)
+        if skipped:
+            sk_types = {}
+            for _, t in skipped:
+                sk_types[t] = sk_types.get(t, 0) + 1
+            print(f"Skipping non-wall selection: " + ", ".join(f"{n} {t}" for t, n in sk_types.items()))
+        print(f"Walls to update: {len(walls)}")
+
+        # 3. Find wall surface property GUIDs by name lookup ("Wall / Inside Face Surface", etc.)
+        props = discover_surface_properties(port, conn)
+        if not props:
+            print("Could not find Wall surface properties (Inside/Outside/Edge Face Surface).", file=sys.stderr)
+            print("Run `ac properties surface` to inspect what's available.", file=sys.stderr)
+            sys.exit(3)
+
+        sides = ["ref", "opp", "side"] if side == "all" else [side]
+        targeted = [s for s in sides if s in props]
+        if not targeted:
+            print(f"No matching properties for sides {sides}. Discovered: {list(props.keys())}", file=sys.stderr)
+            sys.exit(3)
+        print(f"Targeting sides: {', '.join(targeted)}  ({', '.join(props[s]['name'] for s in targeted)})")
+
+        # 4. Build SetPropertyValuesOfElements payload — Integer value = surface index
+        epv = []
+        for w in walls:
+            for s in targeted:
+                epv.append({
+                    "elementId": w["elementId"],
+                    "propertyId": {"guid": props[s]["guid"]},
+                    "propertyValue": {"value": str(surface_idx)},
+                })
+
+        if not epv:
+            print("Built 0 property updates — aborting.", file=sys.stderr); sys.exit(3)
+
+        res = call_tapir(port, "SetPropertyValuesOfElements",
+                         {"elementPropertyValues": epv}, conn=conn, strict=True)
+        results = res.get("executionResults", [])
+        ok = sum(1 for r in results if r.get("success") is True)
+        fail = [r for r in results if r.get("success") is False or r.get("error")]
+        print(f"Sent {len(epv)} updates: ok={ok}  fail={len(fail)}")
+        if fail:
+            # Surface the most common error code with a hint.
+            codes = {}
+            for r in fail:
+                c = r.get("error", {}).get("code")
+                codes[c] = codes.get(c, 0) + 1
+            top_code, top_n = max(codes.items(), key=lambda x: x[1])
+            hint = _ERR_HINT.get(top_code, "")
+            print(f"  most common error: code={top_code} ({top_n}x){'  — ' + hint if hint else ''}",
+                  file=sys.stderr)
+            if top_code == -2130312310:
+                print(
+                    "  NOTE: Archicad's JSON-RPC API does not currently support direct\n"
+                    "        wall surface override via SetPropertyValuesOfElements, even though\n"
+                    "        the property is reported as editable. Use the Wall Settings dialog,\n"
+                    "        or modify the wall's Building Material/Composite, instead.",
+                    file=sys.stderr)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def parse_port_override():
+    if "--port" in sys.argv:
+        idx = sys.argv.index("--port")
+        return int(sys.argv[idx+1])
+    return None
+
+def positional_args():
+    """Return argv with flags stripped, so we can index command/params reliably."""
+    skip_flag = {"--no-daemon", "--by-category", "--all-walls", "--all-floors"}
+    skip_pair = {"--port", "--side", "--filter-layer", "--out", "--min-floor", "--max-floor"}
+    out, i = [], 0
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a in skip_pair:
+            i += 2; continue
+        if a in skip_flag:
+            i += 1; continue
+        out.append(a); i += 1
+    return out
+
+def flag_value(name, default=None):
+    """Read --flag VALUE from sys.argv."""
+    if name in sys.argv:
+        idx = sys.argv.index(name)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return default
+
+def has_flag(name):
+    return name in sys.argv
+
+def daemon_alive():
+    try:
+        with open(DAEMON_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+def main():
+    argv = positional_args()
+    if len(argv) < 2:
+        print(__doc__); sys.exit(1)
+    cmd = argv[1]
+
+    if cmd == "--daemon":
+        run_daemon(); return
+
+    if cmd == "stop":
+        if daemon_call({"cmd": "stop"}, timeout=1):
+            print("daemon stopped")
+        else:
+            print("no daemon running")
+        return
+
+    if cmd == "status":
+        pid = daemon_alive()
+        try:
+            cport = open(PORT_CACHE).read().strip()
+            cage  = int(time.time() - os.stat(PORT_CACHE).st_mtime)
+        except Exception:
+            cport, cage = None, None
+        print(f"daemon:     {'running pid='+str(pid) if pid else 'not running'}")
+        print(f"socket:     {DAEMON_SOCK} {'present' if os.path.exists(DAEMON_SOCK) else 'absent'}")
+        print(f"port-cache: {cport or 'empty'}{f' (age {cage}s)' if cage is not None else ''}")
+        return
+
+    port_override = parse_port_override()
+
+    if cmd == "ports":
+        # Always do a fresh scan with project names; cheap to do directly.
+        hits = None
+        if port_override is None and "--no-daemon" not in sys.argv and ensure_daemon_running():
+            resp = daemon_call({"cmd": "ports"})
+            if resp and "ports" in resp:
+                hits = resp["ports"]
+        if hits is None:
+            hits = scan_ports(with_project_name=True)
+        if not hits:
+            print("No active Archicad found on ports 19723–19743.", file=sys.stderr)
+            print("Checklist:", file=sys.stderr)
+            print("  1. Archicad is running with at least one project open.", file=sys.stderr)
+            print("  2. The Tapir Archicad Add-On is installed and enabled in Archicad.", file=sys.stderr)
+            print("     (Without it, Archicad does not open the HTTP port that `ac` talks to.)", file=sys.stderr)
+            sys.exit(1)
+        for p, info in hits:
+            print(f"{p}\tArchicad {info.get('version')}\t{info.get('projectName','?')}")
+        return
+
+    if cmd == "doctor":
+        # Self-check: walks through every prerequisite and reports.
+        print("ac doctor — checking install...")
+        ok_all = True
+        def chk(label, ok, hint=""):
+            nonlocal ok_all
+            mark = "✓" if ok else "✗"
+            print(f"  [{mark}] {label}" + (f"  — {hint}" if hint else ""))
+            if not ok: ok_all = False
+
+        # 1. python3 reachable (we're running on it, so trivially yes)
+        chk("python3 available", True, sys.executable)
+        # 2. ac binary in expected location
+        ac_path = os.path.expanduser("~/.local/bin/ac")
+        chk("ac CLI at ~/.local/bin/ac", os.path.exists(ac_path), ac_path)
+        # 3. uv available (needed for `ac schedule`)
+        uv_path = os.path.expanduser("~/.local/bin/uv")
+        chk("uv on PATH or ~/.local/bin/uv", os.path.exists(uv_path), uv_path if os.path.exists(uv_path) else "missing — `ac schedule` will fail")
+        # 4. schedule helper script
+        sched = os.path.expanduser("~/.local/share/ac-scripts/build_schedule.py")
+        chk("schedule helper installed", os.path.exists(sched), sched)
+        # 5. slash command
+        slash = os.path.expanduser("~/.claude/commands/archicad.md")
+        chk("/archicad slash command installed", os.path.exists(slash), slash)
+        # 6. global CLAUDE.md has the rules block
+        cmd_md = os.path.expanduser("~/.claude/CLAUDE.md")
+        if os.path.exists(cmd_md):
+            text = open(cmd_md).read()
+            chk("CLAUDE.md has the fast-path rules",
+                "<!-- ARCHICAD-FAST-START -->" in text and "<!-- ARCHICAD-FAST-END -->" in text,
+                cmd_md)
+        else:
+            chk("CLAUDE.md exists", False, f"{cmd_md} missing — re-run install.sh")
+
+        # 7. Archicad reachable
+        hits = scan_ports(with_project_name=True)
+        if hits:
+            for p, info in hits:
+                chk(f"Archicad reachable on port {p}", True,
+                    f"v{info.get('version','?')}  project={info.get('projectName','(unsaved)')}")
+        else:
+            chk("Archicad reachable", False,
+                "no HTTP listener on ports 19723–19743. Install the Tapir Archicad Add-On in Archicad, then open a project.")
+
+        # 8. daemon health
+        d_pid = daemon_alive()
+        chk("background daemon", d_pid is not None,
+            f"pid={d_pid}" if d_pid else "not running (auto-spawns on first call — not an error)")
+
+        print()
+        print("OK — all checks passed." if ok_all else "Some checks failed. See messages above.")
+        sys.exit(0 if ok_all else 2)
+
+    if cmd == "call":
+        params = json.loads(argv[3]) if len(argv) > 3 else None
+        print(json.dumps(call_via("official", argv[2], params, port_override), indent=2))
+
+    elif cmd == "tapir":
+        params = json.loads(argv[3]) if len(argv) > 3 else None
+        print(json.dumps(call_via("tapir", argv[2], params, port_override), indent=2))
+
+    elif cmd == "categories":
+        r = call_via("tapir", "GetAttributesByType", {"attributeType": "ZoneCategory"}, port_override)
+        for a in r.get("attributes", []):
+            print(f"{a['attributeId']['guid']}\t{a['name']}")
+
+    elif cmd == "zones":
+        # Multi-call: do all calls on one shared HTTP keep-alive connection.
+        if port_override is not None:
+            port, conn = port_override, HTTPConnection("127.0.0.1", port_override, timeout=QUERY_TIMEOUT)
+        else:
+            port, conn = shared_http_conn()
+        try:
+            zones = call_tapir(port, "GetElementsByType", {"elementType": "Zone"}, conn=conn).get("elements", [])
+            guids = [z["elementId"]["guid"] for z in zones]
+            if "--by-category" in sys.argv:
+                details = call_tapir(port, "GetDetailsOfElements",
+                                     {"elements": [{"elementId": {"guid": g}} for g in guids]}, conn=conn)
+                cats = call_tapir(port, "GetAttributesByType", {"attributeType": "ZoneCategory"}, conn=conn)
+                cat_name = {a["attributeId"]["guid"].lower(): a["name"]
+                            for a in cats.get("attributes", [])}
+                counts = {}
+                for d in details.get("detailsOfElements", []):
+                    cid = d.get("details", {}).get("categoryAttributeId", {}).get("guid", "").lower()
+                    key = cat_name.get(cid, cid or "?")
+                    counts[key] = counts.get(key, 0) + 1
+                for name, n in sorted(counts.items(), key=lambda x: -x[1]):
+                    print(f"{n}\t{name}")
+                print(f"---\n{len(guids)}\tTOTAL")
+            else:
+                print(len(guids))
+        finally:
+            try: conn.close()
+            except Exception: pass
+
+    elif cmd == "measure":
+        if len(argv) >= 4:
+            guids = [argv[2], argv[3]]
+        else:
+            sel = call_via("tapir", "GetSelectedElements", {}, port_override)
+            elems = sel.get("elements", [])
+            if len(elems) != 2:
+                print(f"Select exactly 2 elements (got {len(elems)})", file=sys.stderr); sys.exit(1)
+            guids = [e["elementId"]["guid"] for e in elems]
+
+        dist, info = measure_elements(guids, port_override=port_override)
+        print(f"Element 1: {info[0]['id']} ({info[0]['type']})  thickness≈{info[0]['thickness']*1000:.0f}mm")
+        print(f"Element 2: {info[1]['id']} ({info[1]['type']})  thickness≈{info[1]['thickness']*1000:.0f}mm")
+        if dist is not None:
+            print(f"Face-to-face clear distance: {dist:.0f}mm  ({dist/1000:.3f}m)")
+        else:
+            print("Could not compute distance")
+
+    elif cmd == "selected":
+        cmd_selected(port_override=port_override)
+
+    elif cmd == "surfaces":
+        pat = argv[2] if len(argv) > 2 else None
+        cmd_surfaces(pat, port_override=port_override)
+
+    elif cmd == "layers":
+        pat = argv[2] if len(argv) > 2 else None
+        cmd_layers(pat, port_override=port_override)
+
+    elif cmd == "properties":
+        pat = argv[2] if len(argv) > 2 else None
+        cmd_properties(pat, port_override=port_override)
+
+    elif cmd == "schedule":
+        # Locate the build_schedule.py script (installed alongside ac).
+        script = os.path.expanduser("~/.local/share/ac-scripts/build_schedule.py")
+        if not os.path.exists(script):
+            print(f"schedule script not found at {script}", file=sys.stderr)
+            print("Re-run install.sh to install the helper scripts.", file=sys.stderr)
+            sys.exit(2)
+
+        # Resolve port (script needs HTTP, doesn't go via daemon)
+        port = port_override if port_override is not None else resolve_port_directly()
+        if port is None:
+            print("No active Archicad found", file=sys.stderr); sys.exit(2)
+
+        out = flag_value("--out") or os.path.expanduser("~/Desktop/Window-Door-Schedule.xlsx")
+        min_floor = flag_value("--min-floor", "0")
+        max_floor = flag_value("--max-floor", "999")
+        if has_flag("--all-floors"):
+            min_floor, max_floor = "-999", "999"
+
+        env = dict(os.environ)
+        env["AC_PORT"] = str(port)
+        env["AC_SCHEDULE_OUT"] = out
+        env["AC_SCHEDULE_MIN_FLOOR"] = str(min_floor)
+        env["AC_SCHEDULE_MAX_FLOOR"] = str(max_floor)
+
+        uv = os.path.expanduser("~/.local/bin/uv")
+        if not os.path.exists(uv):
+            uv = "uv"  # fall through to PATH
+        argv = [uv, "run", "--no-project",
+                "--with", "openpyxl", "--with", "Pillow",
+                "python3", script]
+        os.execvpe(argv[0], argv, env)
+
+    elif cmd == "set-wall-bm":
+        if len(argv) < 3:
+            print("usage: ac set-wall-bm <name> [--all-walls] [--filter-layer <regex>]",
+                  file=sys.stderr); sys.exit(1)
+        cmd_set_wall_structure("BuildingMaterial", argv[2],
+                               all_walls=has_flag("--all-walls"),
+                               layer_filter=flag_value("--filter-layer"),
+                               port_override=port_override)
+
+    elif cmd == "set-wall-composite":
+        if len(argv) < 3:
+            print("usage: ac set-wall-composite <name> [--all-walls] [--filter-layer <regex>]",
+                  file=sys.stderr); sys.exit(1)
+        cmd_set_wall_structure("Composite", argv[2],
+                               all_walls=has_flag("--all-walls"),
+                               layer_filter=flag_value("--filter-layer"),
+                               port_override=port_override)
+
+    elif cmd == "set-surface":
+        if len(argv) < 3:
+            print("usage: ac set-surface <surface_name> [--side ref|opp|side|all] [--all-walls] [--filter-layer <regex>]",
+                  file=sys.stderr); sys.exit(1)
+        surface_name = argv[2]
+        side = (flag_value("--side", "all") or "all").lower()
+        if side not in ("ref", "opp", "side", "all"):
+            print(f"--side must be ref|opp|side|all (got {side})", file=sys.stderr); sys.exit(1)
+        cmd_set_surface(
+            surface_name,
+            side=side,
+            all_walls=has_flag("--all-walls"),
+            layer_filter=flag_value("--filter-layer"),
+            port_override=port_override,
+        )
+
+    else:
+        print(__doc__); sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except AcApiError as e:
+        print(explain_ac_error(e), file=sys.stderr)
+        sys.exit(2)
